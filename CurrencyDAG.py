@@ -1,89 +1,107 @@
+import boto3
+import csv
+import os
+import requests
 from airflow import DAG
 from airflow.decorators import task
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from datetime import datetime
-import requests
-import logging
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.providers.amazon.aws.transfers.s3_to_redshift import S3ToRedshiftOperator
+from datetime import datetime, timedelta
 
-def get_Redshift_connection(autocommit=True):
-    hook = PostgresHook(postgres_conn_id='redshift_dev_db')
-    conn = hook.get_conn()
-    conn.autocommit = autocommit
-    return conn.cursor()
+# AWS S3 설정
+S3_BUCKET = "your-s3-bucket"
+S3_KEY = "exchange_rate_data/exchange_rate.csv"
+LOCAL_FILE_PATH = "C:\Users\kkj214\Repositories\Currency_ETL\exchange_rate.csv"
 
-@task
-def extract_transform(api_key):
-    # Korea EximBank API URL
-    api_url = f"https://www.koreaexim.go.kr/site/program/financial/exchangeJSON?authkey={api_key}&searchdate=20241125&data=AP01"
-    
-    # API 호출
-    response = requests.get(api_url)
-    if response.status_code != 200:
-        raise Exception(f"API 호출 실패: {response.status_code}")
-    
-    data = response.json()
-    
-    # 필요한 데이터 추출
-    records = []
-    for item in data:
-        currency = item['cur_unit']  # 통화 코드
-        base_currency = "KRW"  # 기준 통화
-        exchange_rate = item['deal_bas_r']  # 기준 환율
-        exchange_rate = float(exchange_rate.replace(",", ""))  # 쉼표 제거 및 float 변환
-        date = item['bkpr']  # 기준일
-        
-        records.append([currency, base_currency, exchange_rate, date])
-    
-    return records
+# API 설정
+API_URL_TEMPLATE = "https://www.koreaexim.go.kr/site/program/financial/exchangeJSON?authkey={api_key}&searchdate={date}&data=AP01"
 
-def _create_table(cur, schema, table, drop_first):
-    if drop_first:
-        cur.execute(f"DROP TABLE IF EXISTS {schema}.{table};")
-    cur.execute(f"""
-        CREATE TABLE {schema}.{table} (
-            currency VARCHAR(10),
-            base_currency VARCHAR(10),
-            exchange_rate FLOAT,
-            date DATE
-        );
-    """)
-
-@task
-def load(schema, table, records):
-    logging.info("Load started")
-    cur = get_Redshift_connection()
-    try:
-        cur.execute("BEGIN;")
-        # 원본 테이블이 없으면 생성
-        _create_table(cur, schema, table, False)
-
-        # 임시 테이블로 원본 테이블 복사
-        cur.execute(f"CREATE TEMP TABLE t AS SELECT * FROM {schema}.{table};")
-        for r in records:
-            sql = f"""
-                INSERT INTO t VALUES (
-                    '{r[0]}', '{r[1]}', {r[2]}, '{r[3]}'
-                );
-            """
-            print(sql)
-            cur.execute(sql)
-
-        # 원본 테이블 생성 및 데이터 복사
-        _create_table(cur, schema, table, True)
-        cur.execute(f"INSERT INTO {schema}.{table} SELECT DISTINCT * FROM t;")
-        cur.execute("COMMIT;")
-    except Exception as error:
-        logging.error(error)
-        cur.execute("ROLLBACK;")
-        raise
-    logging.info("Load done")
+default_args = {
+    'owner': 'airflow',
+    'start_date': datetime(2024, 1, 1),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
 
 with DAG(
-    dag_id='ExchangeRate_ETL',
-    start_date=datetime(2024, 11, 24),
-    catchup=False,
-    tags=['ETL', 'API']
+    dag_id="exchange_rate_etl",
+    default_args=default_args,
+    schedule_interval="@daily",
+    catchup=True,
+    tags=["ETL", "API"],
 ) as dag:
-    api_key = "API_KEY"
-    records = extract_transform(api_key)
-    load("kyungjun", "exchange_rate", records)
+
+    @task
+    def extract_transform(api_key, start_date, end_date):
+        """
+        1. API 데이터를 추출하고 변환
+        2. 로컬 CSV 파일로 저장
+        """
+        current_date = start_date
+        records = []
+
+        while current_date <= end_date:
+            # API 호출
+            formatted_date = current_date.strftime("%Y%m%d")
+            response = requests.get(API_URL_TEMPLATE.format(api_key=api_key, date=formatted_date))
+            if response.status_code != 200:
+                raise Exception(f"API 호출 실패: {response.status_code}")
+            
+            data = response.json()
+            for item in data:
+                if item['cur_unit'] == "USD":  # USD만 필터링
+                    records.append([
+                        item['cur_unit'],  # currency_code
+                        "KRW",  # base_currency
+                        float(item['deal_bas_r'].replace(",", "")),  # exchange_rate
+                        current_date.strftime("%Y-%m-%d"),  # reference_date
+                    ])
+            current_date += timedelta(days=1)
+
+        # 로컬 파일 저장
+        with open(LOCAL_FILE_PATH, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["currency_code", "base_currency", "exchange_rate", "reference_date"])
+            writer.writerows(records)
+
+        return LOCAL_FILE_PATH
+
+    @task
+    def upload_to_s3(file_path):
+        """
+        3. 변환된 데이터를 S3에 업로드
+        """
+        s3 = boto3.client('s3')
+        s3.upload_file(file_path, S3_BUCKET, S3_KEY)
+        return f"s3://{S3_BUCKET}/{S3_KEY}"
+
+    load_to_redshift = S3ToRedshiftOperator(
+        task_id="load_to_redshift",
+        schema="raw_data",
+        table="currency",
+        s3_bucket=S3_BUCKET,
+        s3_key=S3_KEY,
+        copy_options=["csv", "IGNOREHEADER 1"],
+        aws_conn_id="aws_default",
+        redshift_conn_id="redshift_default"
+    )
+
+    transform_to_analytics = PostgresOperator(
+        task_id="transform_to_analytics",
+        postgres_conn_id="redshift_default",
+        sql="""
+        INSERT INTO analytics.currency_analytics (currency_code, base_currency, avg_exchange_rate, reference_month)
+        SELECT
+            currency_code,
+            base_currency,
+            AVG(exchange_rate) AS avg_exchange_rate,
+            DATE_TRUNC('month', reference_date) AS reference_month
+        FROM raw_data.currency
+        GROUP BY currency_code, base_currency, DATE_TRUNC('month', reference_date);
+        """
+    )
+
+    # Task 간 의존성 설정
+    records_file = extract_transform("your_api_key", datetime(2024, 1, 1), datetime.now())
+    s3_path = upload_to_s3(records_file)
+    records_file >> s3_path >> load_to_redshift >> transform_to_analytics
